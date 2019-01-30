@@ -1,0 +1,200 @@
+Imports Mantis.LVision.DBAccess.DbRoutines
+Imports Mantis.LVision.DBAccess.StockInDev
+Imports Mantis.LVision.Interfaces
+
+Public Class CTransSST
+    Implements Mantis.LVision.DBAccess.DbRoutines.ICustomStock
+
+    Public Const _Relocate As String = "4" ' ID = 7
+    Public Const _Receipt As String = "1" ' ID = 1
+    Public Const _Puting As String = "2" ' ID = 2
+    Public Const _StockChange As String = "90" ' ID = 5
+
+    Public Sub Run(
+              ByVal Con As System.Data.IDbConnection,
+              ByVal Trans As System.Data.IDbTransaction,
+              ByVal dsStockContainer As System.Data.DataSet,
+              ByVal dsStock As System.Data.DataSet,
+              ByVal dsStockPacktype As System.Data.DataSet,
+              ByVal dsStockAttributesValues As System.Data.DataSet,
+              ByVal dsStockAttributesValuesEx As System.Data.DataSet,
+              ByVal receiptID As Integer,
+              ByVal receiptItemID As Integer,
+              ByVal returnID As Integer,
+              ByVal returnItemID As Integer,
+              ByVal args As Mantis.LVision.Interfaces.ILVisionForm,
+              ByVal transactionCode As String,
+              ByVal transactionID As Integer,
+              ByVal ItemQuantity As Double,
+              ByVal TaskCode As String,
+              ByVal ReasonCode As String,
+              ByVal OrderShipmentID As Integer,
+              ByVal OrderShipItemID As Integer,
+              ByVal OrderShipmentGroupID As Integer,
+              ByVal OrderShipGroupItemID As Integer,
+              ByVal ProductionOrderID As Integer,
+              ByVal ProdItemByProdOrderID As Integer) Implements Mantis.LVision.DBAccess.DbRoutines.ICustomStock.Run
+
+        If transactionCode <> _Receipt Then
+            Exit Sub
+        End If
+
+        Try
+            If dsStock.IsEmpty OrElse dsStockContainer.IsEmpty Then Exit Sub
+            For Each row As DataRow In dsStockContainer.Tables(0).Select
+                Dim ContainerID As Integer = CInt(row.Item("stc_ID"))
+                Dim dsTask As DataSet
+                Dim sb As New Text.StringBuilder
+                Dim dbr As New Mantis.LVision.DBAccess.DbRoutines.Routines
+                sb.AppendLine("select LV_Task.*, loc_BuildingID ")
+                sb.AppendLine("from LV_Task (nolock)")
+                sb.AppendLine("inner join lv_Location  (nolock) on tsk_ToLocationCode = loc_Code ")
+                sb.AppendLine("where tsk_ContainerID = <PARAM_NUM>" & ContainerID & "</PARAM> ")
+                sb.AppendLine("and tsk_TransactionTypeID = 2 and tsk_StatusID = 1 and tsk_TaskListID is null ")
+                dsTask = dbr.SelectTable(sb.ToString, args, Con, Trans)
+
+                If dsTask.IsEmpty Then Exit Sub
+                Dim BuildingID As Integer = CInt(dsTask.Tables(0).Rows(0).Item("loc_BuildingID"))
+                dsTask.Tables(0).PrimaryKey = New DataColumn() {dsTask.Tables(0).Columns("tsk_ID")}
+                dsTask.Tables(0).TableName = "LV_Task"
+                Dim dsTaskExport As DataSet = dsTask.Copy
+                sb.Clear()
+                sb.AppendLine("select LV_TaskList.*, LV_Task.* ")
+                sb.AppendLine("from LV_TaskList (nolock)")
+                sb.AppendLine("inner join LV_Task  (nolock) on tsk_TaskListID = tkl_ID  ")
+                sb.AppendLine("inner join lv_Location  (nolock) on tsk_ToLocationCode = loc_Code ")
+                sb.AppendLine("where loc_BuildingID = <PARAM_NUM>" & BuildingID & "</PARAM> ")
+                sb.AppendLine("and tsk_TransactionTypeID = 2 and tkl_StatusID = 5 ")
+                sb.AppendLine("order by tkl_ID desc") 'group by tkl_ID
+
+                Dim sb1 As New System.Text.StringBuilder()
+                sb1.AppendLine("select isnull(fav_Value,'') maxTasksPerList from COM_FormAttributesValues (nolock) ")
+                sb1.AppendLine("inner join COM_FormAttributes (nolock) on fav_AttributeID = fat_ID and fat_Code =  'LM'")
+                sb1.AppendLine("where fav_FormID = 24")
+
+
+                Dim dsTaskList As DataSet = Nothing
+                Dim TaskListID As Integer
+                Dim newTaskListID As Integer = 0
+                Dim ds As DataSet = dbr.SelectMultipleTable(New String() {sb.ToString, sb1.ToString}, New String() {"TaskList", "maxTasksPerList"},
+                                        Nothing, args, Con, Trans)
+                If ds.Tables("maxTasksPerList").IsEmpty Then
+                    Exit Sub
+                End If
+
+                Dim maxTasksPerList As Integer = CInt(ds.Tables("maxTasksPerList").Rows(0).Item(0))
+
+                If ds.Tables("TaskList").IsEmpty Then ' create new TaskList and assign current task to it
+                    Create_dsTaskList(dsTaskList, 5, dbr, args) 'suspended
+
+                    Dim intAffected As Integer = Mantis.LVision.DBAccess.DBCode.TaskSQLDataset.LV_TaskList(
+                                                                 dsTaskList, args, Con, Trans)
+
+                    dsTask.Tables(0).Rows(0).Item("tsk_TaskListID") = CType(dsTaskList.Tables(0).Rows(0).Item("tkl_ID"), Integer)
+                    dsTask.Tables(0).Rows(0).Item("tsk_StatusID") = 5
+                    dbr.UpdateTable(dsTask, args, "tsk_ID", "LV_Task",,, Con, Trans, False)
+
+                Else
+                    TaskListID = CInt(ds.Tables("TaskList").Rows(0).Item("tkl_ID")) 'most recent TaskList
+                    Dim TasksCount As Integer = ds.Tables("TaskList").Select("tkl_ID = " & TaskListID).Count
+
+                    If TasksCount + 1 = maxTasksPerList Then 'change all tasks and list status to pending
+                        FixTaskDataset(TaskListID, TaskListID, 1, ds, dsTask)
+                        dbr.UpdateTable(dsTask, args, "tsk_ID", "LV_Task",,, Con, Trans, False)
+                        FixTaskListDataset(TaskListID, 1, ds, dsTaskList)
+                        dbr.UpdateTable(dsTaskList, args, "tkl_ID", "LV_TaskList",,, Con, Trans, False)
+
+                    ElseIf TasksCount + 1 > maxTasksPerList Then 'create new TaskList and assign status to suspended
+                        Create_dsTaskList(dsTaskList, 5, dbr, args)
+                        Dim intAffected As Integer = Mantis.LVision.DBAccess.DBCode.TaskSQLDataset.LV_TaskList(
+                                                                 dsTaskList, args, Con, Trans)
+                        dsTask.Tables(0).Rows(0).Item("tsk_TaskListID") = CType(dsTaskList.Tables(0).Rows(0).Item("tkl_ID"), Integer)
+                        dsTask.Tables(0).Rows(0).Item("tsk_StatusID") = 5 'suspended
+                        dbr.UpdateTable(dsTask, args, "tsk_ID", "LV_Task",,, Con, Trans, False)
+                    Else
+                        TaskListID = CInt(ds.Tables(0).Rows(0).Item("tkl_ID"))
+                        dsTask.Tables(0).TableName = "LV_Task"
+                        dsTask.Tables(0).Rows(0).Item("tsk_TaskListID") = TaskListID
+                        dsTask.Tables(0).Rows(0).Item("tsk_StatusID") = 5 'suspended
+                        dbr.UpdateTable(dsTask, args, "tsk_ID", "LV_Task",,, Con, Trans, False)
+
+                    End If
+
+                End If
+            Next
+
+        Catch ex As Exception
+            Throw
+        End Try
+    End Sub
+
+    Sub Create_dsTaskList(ByRef dsTaskList As DataSet, StatusID As Integer, dbr As Mantis.LVision.DBAccess.DbRoutines.Routines, args As ILVisionForm)
+        dsTaskList = dbr.OpenSchema("LV_TaskList", args)
+        Dim TaskListRow As DataRow = dsTaskList.Tables(0).NewRow
+        TaskListRow.Item("tkl_ID") = -1
+        TaskListRow.Item("tkl_TransactionTypeID") = 2 'putting
+        TaskListRow.Item("tkl_CreateDate") = System.DateTime.Now
+        TaskListRow.Item("tkl_CreateUserID") = args.UserID
+        TaskListRow.Item("tkl_StatusID") = StatusID
+        TaskListRow.Item("tkl_LogisticSiteID") = args.LogisticSiteID
+        TaskListRow.Item("tkl_DomainID") = args.DomainID
+
+        If IsDBNull(TaskListRow.Item("tkl_Code")) Then
+            TaskListRow.Item("tkl_Code") = Mantis.LVision.DBAccess.StockInDev.CTask.GetTaskListCode(2, args)
+        End If
+
+        dsTaskList.Tables(0).Rows.Add(TaskListRow)
+    End Sub
+
+    Sub FixTaskDataset(newTaskListID As Integer, taskListID As Integer, newStatusID As Integer, ds As DataSet,
+                       ByRef dsTask As DataSet)
+        Dim Columns As New List(Of String)
+        Dim rows() As DataRow = ds.Tables(0).Select("tkl_ID = " & taskListID)
+        Dim dsTasks2Append = ds.Clone
+        For Each r As DataRow In rows
+            r.Item("tsk_StatusID") = newStatusID
+            r.Item("tkl_StatusID") = newStatusID
+            If newTaskListID > 0 Then
+                r.Item("tsk_taskListID") = newTaskListID
+            End If
+            dsTasks2Append.Tables(0).ImportRow(r)
+        Next
+
+        For Each col As DataColumn In ds.Tables(0).Columns
+            If Not col.ColumnName.StartsWith("tsk_") Then
+                dsTasks2Append.Tables(0).Columns.Remove(col.ColumnName)
+            End If
+        Next
+
+        dsTasks2Append.Tables(0).PrimaryKey = New DataColumn() {dsTasks2Append.Tables(0).Columns("tsk_ID")}
+        dsTasks2Append.Tables(0).TableName = "LV_Task"
+        If newTaskListID > 0 Then
+            dsTask.Tables(0).Rows(0).Item("tsk_taskListID") = newTaskListID
+        Else
+            dsTask.Tables(0).Rows(0).Item("tsk_taskListID") = taskListID
+        End If
+        dsTask.Merge(dsTasks2Append)
+    End Sub
+
+    Sub FixTaskListDataset(taskListID As Integer, newStatusID As Integer, ds As DataSet,
+                       ByRef dsTaskList As DataSet)
+        Dim Columns As New List(Of String)
+        Dim rows() As DataRow = ds.Tables(0).Select("tkl_ID = " & taskListID, "tkl_ID desc")
+        dsTaskList = ds.Clone
+        For Each r As DataRow In rows
+            r.Item("tkl_StatusID") = newStatusID
+            dsTaskList.Tables(0).ImportRow(r)
+            Exit For
+        Next
+
+        For Each col As DataColumn In ds.Tables(0).Columns
+            If Not col.ColumnName.StartsWith("tkl_") Then
+                dsTaskList.Tables(0).Columns.Remove(col.ColumnName)
+            End If
+        Next
+
+        dsTaskList.Tables(0).PrimaryKey = New DataColumn() {dsTaskList.Tables(0).Columns("tkl_ID")}
+        dsTaskList.Tables(0).TableName = "LV_TaskList"
+    End Sub
+
+End Class
